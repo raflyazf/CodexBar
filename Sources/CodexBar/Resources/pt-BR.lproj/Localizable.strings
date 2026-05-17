@@ -393,7 +393,7 @@
 "remove_account_message" = "Remover %@ do CodexBar? O diretório Codex gerenciado será apagado.";
 "version_format" = "Versão %@";
 "vertex_ai_login_instructions" = "Para acompanhar o uso do Vertex AI, autentique-se no Google Cloud.\n\n1. Abra o Terminal\n2. Execute: gcloud auth application-default login\n3. Siga os prompts no navegador para entrar\n4. Defina seu projeto: gcloud config set project PROJECT_ID\n\nAbrir o Terminal agora?";
-"workspaceID is set but only opencode and opencodego support workspaceID." = "workspaceID está definido, mas somente opencode e opencodego oferecem suporte a workspaceID.";
+"workspaceID is set but only opencode, opencodego, and deepgram support workspaceID." = "workspaceID está definido, mas somente opencode, opencodego e deepgram oferecem suporte a workspaceID.";
 "© 2026 Peter Steinberger. MIT License." = "© 2026 Peter Steinberger. Licença MIT.";
 
 /* General Pane */
@@ -457,7 +457,7 @@
 "remove_codex_account_title" = "Remover conta Codex?";
 "remove" = "Remover";
 "managed_login_already_running" = "Um login gerenciado do Codex já está em andamento. Aguarde terminar antes de adicionar ou reautenticar outra conta.";
-"managed_login_failed" = "O login gerenciado do Codex não foi concluído. Tente novamente após finalizar o fluxo de login no navegador.";
+"managed_login_failed" = "O login gerenciado do Codex não foi concluído. Verifique se `codex --version` funciona no Terminal. Se o macOS bloqueou ou moveu `codex` para o Lixo, remova instalações duplicadas antigas, execute `npm install -g --include=optional @openai/codex@latest` e tente novamente.";
 "managed_login_missing_email" = "O login do Codex foi concluído, mas nenhum e-mail da conta estava disponível. Tente novamente após confirmar que a conta está totalmente conectada.";
 "workspace_selection_cancelled" = "O CodexBar encontrou vários workspaces, mas nenhum foi selecionado.";
 "unsafe_managed_home" = "O CodexBar se recusou a modificar um caminho de diretório gerenciado inesperado: %@";
@@ -522,6 +522,8 @@
 "weekly_limit_confetti_subtitle" = "Mostra confete em tela cheia quando o uso semanal for renovado.";
 "hide_personal_info_title" = "Ocultar informações pessoais";
 "hide_personal_info_subtitle" = "Oculta endereços de e-mail na barra de menus e na UI do menu.";
+"show_provider_storage_usage_title" = "Mostrar uso de armazenamento dos provedores";
+"show_provider_storage_usage_subtitle" = "Mostra o uso de disco local nos menus. Verifica em segundo plano caminhos conhecidos pertencentes aos provedores.";
 "section_keychain_access" = "Acesso ao Keychain";
 "keychain_access_caption" = "Desativa todas as leituras e gravações do Keychain. A importação de cookies do navegador fica indisponível; cole cabeçalhos Cookie manualmente em Provedores.";
 "disable_keychain_access_title" = "Desativar acesso ao Keychain";

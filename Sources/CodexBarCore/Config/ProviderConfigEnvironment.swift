@@ -9,6 +9,9 @@ public enum ProviderConfigEnvironment {
         if provider == .bedrock {
             return self.applyBedrockOverrides(base: base, config: config)
         }
+        if provider == .deepgram {
+            return self.applyDeepgramOverrides(base: base, config: config)
+        }
         guard let apiKey = config?.sanitizedAPIKey, !apiKey.isEmpty else { return base }
         var env = base
         if let key = self.directAPIKeyEnvironmentKey(for: provider) {
@@ -50,10 +53,22 @@ public enum ProviderConfigEnvironment {
         return env
     }
 
+    public static func supportsAPIKeyOverride(for provider: UsageProvider) -> Bool {
+        if self.directAPIKeyEnvironmentKey(for: provider) != nil { return true }
+        switch provider {
+        case .copilot, .kimik2, .warp, .codebuff, .crof, .doubao:
+            return true
+        default:
+            return false
+        }
+    }
+
     private static func directAPIKeyEnvironmentKey(for provider: UsageProvider) -> String? {
         switch provider {
         case .openai:
             OpenAIAPISettingsReader.adminAPIKeyEnvironmentKey
+        case .claude:
+            ClaudeAdminAPISettingsReader.adminAPIKeyEnvironmentKey
         case .zai:
             ZaiSettingsReader.apiTokenKey
         case .minimax:
@@ -72,6 +87,8 @@ public enum ProviderConfigEnvironment {
             MoonshotSettingsReader.apiKeyEnvironmentKeys.first
         case .venice:
             VeniceSettingsReader.apiKeyEnvironmentKey
+        case .deepgram:
+            DeepgramSettingsReader.apiKeyEnvironmentKey
         default:
             nil
         }
@@ -93,5 +110,32 @@ public enum ProviderConfigEnvironment {
             env[BedrockSettingsReader.regionKeys[0]] = region
         }
         return env
+    }
+
+    private static func applyDeepgramOverrides(
+        base: [String: String],
+        config: ProviderConfig?) -> [String: String]
+    {
+        guard let config else { return base }
+
+        var env = base
+
+        if let apiKey = config.sanitizedAPIKey {
+            env[DeepgramSettingsReader.apiKeyEnvironmentKey] = apiKey
+        }
+
+        if let projectID = config.sanitizedWorkspaceID {
+            env[DeepgramSettingsReader.projectIDEnvironmentKey] = projectID
+        }
+
+        return env
+    }
+
+    public static func applyProviderConfigOverrides(
+        base: [String: String],
+        provider: UsageProvider,
+        config: ProviderConfig?) -> [String: String]
+    {
+        self.applyAPIKeyOverride(base: base, provider: provider, config: config)
     }
 }

@@ -29,6 +29,22 @@ struct InlineUsageDashboardModel: Equatable {
 }
 
 extension UsageMenuCardView.Model {
+    static func apiProviderUsageNotes(input: Input) -> [String]? {
+        if input.provider == .openai,
+           let usage = input.snapshot?.openAIAPIUsage
+        {
+            return self.openAIAPIUsageNotes(usage)
+        }
+
+        if input.provider == .deepgram,
+           let usage = input.snapshot?.deepgramUsage
+        {
+            return usage.displayLines
+        }
+
+        return nil
+    }
+
     static func openAIAPIUsageNotes(_ usage: OpenAIAPIUsageSnapshot) -> [String] {
         let today = usage.latestDay
         let seven = usage.last7Days
@@ -53,6 +69,11 @@ extension UsageMenuCardView.Model {
     static func inlineUsageDashboard(input: Input) -> InlineUsageDashboardModel? {
         if let usage = input.snapshot?.openAIAPIUsage {
             return self.openAIAPIInlineDashboard(usage)
+        }
+        if input.provider == .claude,
+           let usage = input.snapshot?.claudeAdminAPIUsage
+        {
+            return Self.claudeAdminAPIInlineDashboard(usage)
         }
         if input.provider == .openrouter,
            let usage = input.snapshot?.openRouterUsage
@@ -106,6 +127,45 @@ extension UsageMenuCardView.Model {
                 .init(title: "7d spend", value: UsageFormatter.usdString(last7.costUSD), emphasis: false),
                 .init(title: "30d spend", value: UsageFormatter.usdString(last30.costUSD), emphasis: false),
                 .init(title: "Today req", value: UsageFormatter.tokenCountString(today.requests), emphasis: false),
+            ],
+            points: points,
+            detailLines: details)
+    }
+
+    fileprivate static func claudeAdminAPIInlineDashboard(_ usage: ClaudeAdminAPIUsageSnapshot)
+        -> InlineUsageDashboardModel
+    {
+        let today = usage.latestDay
+        let last7 = usage.last7Days
+        let last30 = usage.last30Days
+        let points = usage.daily.suffix(30).map {
+            InlineUsageDashboardModel.Point(
+                id: $0.day,
+                label: Self.shortDayLabel($0.day),
+                value: $0.costUSD,
+                accessibilityValue: "\($0.day): \(UsageFormatter.usdString($0.costUSD))")
+        }
+        var details = [
+            "30d: \(UsageFormatter.tokenCountString(last30.totalTokens)) tokens",
+            "Cache read: \(UsageFormatter.tokenCountString(last30.cacheReadInputTokens)) tokens",
+        ]
+        if let topModel = usage.topModels.first {
+            details.append("Top model: \(Self.shortModelName(topModel.name))")
+        }
+        return InlineUsageDashboardModel(
+            accessibilityLabel: "Claude Admin API 30 day spend trend",
+            valueStyle: .currencyUSD,
+            kpis: [
+                .init(title: "Today", value: UsageFormatter.usdString(today.costUSD), emphasis: true),
+                .init(title: "7d spend", value: UsageFormatter.usdString(last7.costUSD), emphasis: false),
+                .init(
+                    title: "30d spend",
+                    value: UsageFormatter.usdString(last30.costUSD),
+                    emphasis: false),
+                .init(
+                    title: "Today tokens",
+                    value: UsageFormatter.tokenCountString(today.totalTokens),
+                    emphasis: false),
             ],
             points: points,
             detailLines: details)

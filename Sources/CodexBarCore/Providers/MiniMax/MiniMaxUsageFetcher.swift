@@ -13,12 +13,21 @@ public struct MiniMaxUsageFetcher: Sendable {
         let groupID: String?
     }
 
+    private struct WebFetchContext {
+        let cookie: String
+        let authorizationToken: String?
+        let region: MiniMaxAPIRegion
+        let environment: [String: String]
+        let transport: any ProviderHTTPTransport
+    }
+
     public static func fetchUsage(
         cookieHeader: String,
         authorizationToken: String? = nil,
         groupID: String? = nil,
         region: MiniMaxAPIRegion = .global,
         environment: [String: String] = ProcessInfo.processInfo.environment,
+        session transport: any ProviderHTTPTransport = ProviderHTTPClient.shared,
         now: Date = Date()) async throws -> MiniMaxUsageSnapshot
     {
         guard let cookie = MiniMaxCookieHeader.normalized(from: cookieHeader) else {
@@ -27,21 +36,26 @@ public struct MiniMaxUsageFetcher: Sendable {
 
         do {
             return try await self.fetchCodingPlanHTML(
-                cookie: cookie,
-                authorizationToken: authorizationToken,
-                region: region,
-                environment: environment,
+                context: WebFetchContext(
+                    cookie: cookie,
+                    authorizationToken: authorizationToken,
+                    region: region,
+                    environment: environment,
+                    transport: transport),
                 now: now)
         } catch let error as MiniMaxUsageError {
             if case .parseFailed = error {
                 Self.log.debug("MiniMax coding plan HTML parse failed, trying remains API")
                 return try await self.fetchCodingPlanRemains(
-                    cookie: cookie,
+                    context: WebFetchContext(
+                        cookie: cookie,
+                        authorizationToken: authorizationToken,
+                        region: region,
+                        environment: environment,
+                        transport: transport),
                     remainsContext: RemainsContext(
                         authorizationToken: authorizationToken,
                         groupID: groupID),
-                    region: region,
-                    environment: environment,
                     now: now)
             }
             throw error
@@ -52,7 +66,7 @@ public struct MiniMaxUsageFetcher: Sendable {
         apiToken: String,
         region: MiniMaxAPIRegion = .global,
         now: Date = Date(),
-        session: URLSession = .shared) async throws -> MiniMaxUsageSnapshot
+        session transport: any ProviderHTTPTransport = ProviderHTTPClient.shared) async throws -> MiniMaxUsageSnapshot
     {
         let cleaned = apiToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else {
@@ -63,11 +77,11 @@ public struct MiniMaxUsageFetcher: Sendable {
         // user has no persisted region and we default to `.global`, retry the China endpoint when the global host
         // rejects the token so upgrades don't regress existing setups.
         if region != .global {
-            return try await self.fetchUsageOnce(apiToken: cleaned, region: region, now: now, session: session)
+            return try await self.fetchUsageOnce(apiToken: cleaned, region: region, now: now, transport: transport)
         }
 
         do {
-            return try await self.fetchUsageOnce(apiToken: cleaned, region: .global, now: now, session: session)
+            return try await self.fetchUsageOnce(apiToken: cleaned, region: .global, now: now, transport: transport)
         } catch let error as MiniMaxUsageError {
             guard case .invalidCredentials = error else { throw error }
             Self.log.debug("MiniMax API token rejected for global host, retrying China mainland host")
@@ -76,7 +90,7 @@ public struct MiniMaxUsageFetcher: Sendable {
                     apiToken: cleaned,
                     region: .chinaMainland,
                     now: now,
-                    session: session)
+                    transport: transport)
             } catch {
                 // Preserve the original invalid-credentials error so the fetch pipeline can fall back to web.
                 Self.log.debug("MiniMax China mainland retry failed, preserving global invalidCredentials")
@@ -89,7 +103,7 @@ public struct MiniMaxUsageFetcher: Sendable {
         apiToken: String,
         region: MiniMaxAPIRegion,
         now: Date,
-        session: URLSession) async throws -> MiniMaxUsageSnapshot
+        transport: any ProviderHTTPTransport) async throws -> MiniMaxUsageSnapshot
     {
         var request = URLRequest(url: region.apiRemainsURL)
         request.httpMethod = "GET"
@@ -98,21 +112,25 @@ public struct MiniMaxUsageFetcher: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("CodexBar", forHTTPHeaderField: "MM-API-Source")
 
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
+        let response: ProviderHTTPResponse
+        do {
+            response = try await transport.response(for: request)
+        } catch let error as URLError where error.code == .badServerResponse {
             throw MiniMaxUsageError.networkError("Invalid response")
+        } catch {
+            throw error
         }
 
-        guard httpResponse.statusCode == 200 else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            Self.log.error("MiniMax returned \(httpResponse.statusCode): \(body)")
-            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+        guard response.statusCode == 200 else {
+            let body = String(data: response.data, encoding: .utf8) ?? ""
+            Self.log.error("MiniMax returned \(response.statusCode): \(body)")
+            if response.statusCode == 401 || response.statusCode == 403 {
                 throw MiniMaxUsageError.invalidCredentials
             }
-            throw MiniMaxUsageError.apiError("HTTP \(httpResponse.statusCode)")
+            throw MiniMaxUsageError.apiError("HTTP \(response.statusCode)")
         }
 
-        let snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: data, now: now)
+        let snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: response.data, now: now)
         if let services = snapshot.services, !services.isEmpty {
             Self.log.debug("MiniMax multi-service response detected: \(services.count) services")
         }
@@ -120,17 +138,14 @@ public struct MiniMaxUsageFetcher: Sendable {
     }
 
     private static func fetchCodingPlanHTML(
-        cookie: String,
-        authorizationToken: String?,
-        region: MiniMaxAPIRegion,
-        environment: [String: String],
+        context: WebFetchContext,
         now: Date) async throws -> MiniMaxUsageSnapshot
     {
-        let url = self.resolveCodingPlanURL(region: region, environment: environment)
+        let url = self.resolveCodingPlanURL(region: context.region, environment: context.environment)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        if let authorizationToken {
+        request.setValue(context.cookie, forHTTPHeaderField: "Cookie")
+        if let authorizationToken = context.authorizationToken {
             request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
         }
         let acceptHeader = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -143,34 +158,38 @@ public struct MiniMaxUsageFetcher: Sendable {
         let origin = self.originURL(from: url)
         request.setValue(origin.absoluteString, forHTTPHeaderField: "origin")
         request.setValue(
-            self.resolveCodingPlanRefererURL(region: region, environment: environment).absoluteString,
+            self.resolveCodingPlanRefererURL(region: context.region, environment: context.environment).absoluteString,
             forHTTPHeaderField: "referer")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
+        let response: ProviderHTTPResponse
+        do {
+            response = try await context.transport.response(for: request)
+        } catch let error as URLError where error.code == .badServerResponse {
             throw MiniMaxUsageError.networkError("Invalid response")
+        } catch {
+            throw error
         }
 
-        guard httpResponse.statusCode == 200 else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            Self.log.error("MiniMax returned \(httpResponse.statusCode): \(body)")
-            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+        guard response.statusCode == 200 else {
+            let body = String(data: response.data, encoding: .utf8) ?? ""
+            Self.log.error("MiniMax returned \(response.statusCode): \(body)")
+            if response.statusCode == 401 || response.statusCode == 403 {
                 throw MiniMaxUsageError.invalidCredentials
             }
-            throw MiniMaxUsageError.apiError("HTTP \(httpResponse.statusCode)")
+            throw MiniMaxUsageError.apiError("HTTP \(response.statusCode)")
         }
 
-        if let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
+        if let contentType = response.response.value(forHTTPHeaderField: "Content-Type"),
            contentType.lowercased().contains("application/json")
         {
-            let snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: data, now: now)
+            let snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: response.data, now: now)
             if let services = snapshot.services, !services.isEmpty {
                 Self.log.debug("MiniMax multi-service response detected: \(services.count) services")
             }
             return snapshot
         }
 
-        let html = String(data: data, encoding: .utf8) ?? ""
+        let html = String(data: response.data, encoding: .utf8) ?? ""
         if html.contains("__NEXT_DATA__") {
             Self.log.debug("MiniMax coding plan HTML contains __NEXT_DATA__")
         }
@@ -181,17 +200,15 @@ public struct MiniMaxUsageFetcher: Sendable {
     }
 
     private static func fetchCodingPlanRemains(
-        cookie: String,
+        context: WebFetchContext,
         remainsContext: RemainsContext,
-        region: MiniMaxAPIRegion,
-        environment: [String: String],
         now: Date) async throws -> MiniMaxUsageSnapshot
     {
-        let baseRemainsURL = self.resolveRemainsURL(region: region, environment: environment)
+        let baseRemainsURL = self.resolveRemainsURL(region: context.region, environment: context.environment)
         let remainsURL = self.appendGroupID(remainsContext.groupID, to: baseRemainsURL)
         var request = URLRequest(url: remainsURL)
         request.httpMethod = "GET"
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue(context.cookie, forHTTPHeaderField: "Cookie")
         if let authorizationToken = remainsContext.authorizationToken {
             request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
         }
@@ -206,34 +223,38 @@ public struct MiniMaxUsageFetcher: Sendable {
         let origin = self.originURL(from: baseRemainsURL)
         request.setValue(origin.absoluteString, forHTTPHeaderField: "origin")
         request.setValue(
-            self.resolveCodingPlanRefererURL(region: region, environment: environment).absoluteString,
+            self.resolveCodingPlanRefererURL(region: context.region, environment: context.environment).absoluteString,
             forHTTPHeaderField: "referer")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
+        let response: ProviderHTTPResponse
+        do {
+            response = try await context.transport.response(for: request)
+        } catch let error as URLError where error.code == .badServerResponse {
             throw MiniMaxUsageError.networkError("Invalid response")
+        } catch {
+            throw error
         }
 
-        guard httpResponse.statusCode == 200 else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            Self.log.error("MiniMax returned \(httpResponse.statusCode): \(body)")
-            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+        guard response.statusCode == 200 else {
+            let body = String(data: response.data, encoding: .utf8) ?? ""
+            Self.log.error("MiniMax returned \(response.statusCode): \(body)")
+            if response.statusCode == 401 || response.statusCode == 403 {
                 throw MiniMaxUsageError.invalidCredentials
             }
-            throw MiniMaxUsageError.apiError("HTTP \(httpResponse.statusCode)")
+            throw MiniMaxUsageError.apiError("HTTP \(response.statusCode)")
         }
 
-        if let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
+        if let contentType = response.response.value(forHTTPHeaderField: "Content-Type"),
            contentType.lowercased().contains("application/json")
         {
-            let snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: data, now: now)
+            let snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: response.data, now: now)
             if let services = snapshot.services, !services.isEmpty {
                 Self.log.debug("MiniMax multi-service response detected: \(services.count) services")
             }
             return snapshot
         }
 
-        let html = String(data: data, encoding: .utf8) ?? ""
+        let html = String(data: response.data, encoding: .utf8) ?? ""
         if self.looksSignedOut(html: html) {
             throw MiniMaxUsageError.invalidCredentials
         }
@@ -623,51 +644,38 @@ enum MiniMaxUsageParser {
         // Convert model_remains to services array for multi-service UI display
         var services: [MiniMaxServiceUsage] = []
         for item in payload.data.modelRemains {
-            // Skip services with no quota (limit = 0)
-            guard let modelName = item.modelName,
-                  let limit = item.currentIntervalTotalCount,
-                  limit > 0,
-                  let remaining = item.currentIntervalUsageCount
-            else {
-                continue
-            }
-
-            // Calculate usage and percentage
-            // current_interval_usage_count is REMAINING quota (not used)
-            let used = max(0, limit - remaining)
-            let percent = limit > 0 ? Double(used) / Double(limit) * 100.0 : 0.0
-
-            // Parse time window
-            let startTime = self.dateFromEpoch(item.startTime)
-            let endTime = self.dateFromEpoch(item.endTime)
-
-            // Determine window type and time range
-            let (windowType, timeRange) = self.parseWindowInfo(
-                startTime: startTime,
-                endTime: endTime,
-                now: now)
-
-            // Calculate reset time
-            let resetsAt = self.resetsAt(end: endTime, remains: item.remainsTime, now: now)
-            let resetDescription = self.resetDescription(
-                for: windowType,
-                timeRange: timeRange,
-                now: now,
-                resetsAt: resetsAt)
-
-            // Map model_name to service type identifier
+            guard let modelName = item.modelName else { continue }
             let serviceTypeIdentifier = self.mapModelNameToServiceType(modelName: modelName)
 
-            let serviceUsage = MiniMaxServiceUsage(
-                serviceType: serviceTypeIdentifier,
-                windowType: windowType,
-                timeRange: timeRange,
-                usage: used,
-                limit: limit,
-                percent: min(100.0, max(0.0, percent)),
-                resetsAt: resetsAt,
-                resetDescription: resetDescription)
-            services.append(serviceUsage)
+            if let intervalService = self.makeServiceUsage(
+                ServiceUsageInput(
+                    serviceType: serviceTypeIdentifier,
+                    windowTypeOverride: nil,
+                    total: item.currentIntervalTotalCount,
+                    remaining: item.currentIntervalUsageCount,
+                    start: item.startTime,
+                    end: item.endTime,
+                    remainsTime: item.remainsTime),
+                now: now)
+            {
+                services.append(intervalService)
+            }
+
+            // current_weekly_usage_count is also REMAINING quota; render only when weekly quota is real.
+            if self.isTextGenerationModelName(modelName),
+               let weeklyService = self.makeServiceUsage(
+                   ServiceUsageInput(
+                       serviceType: serviceTypeIdentifier,
+                       windowTypeOverride: "Weekly",
+                       total: item.currentWeeklyTotalCount,
+                       remaining: item.currentWeeklyUsageCount,
+                       start: item.weeklyStartTime,
+                       end: item.weeklyEndTime,
+                       remainsTime: item.weeklyRemainsTime),
+                   now: now)
+            {
+                services.append(weeklyService)
+            }
         }
 
         // Use first service for backward compatibility fields
@@ -1065,7 +1073,8 @@ enum MiniMaxUsageParser {
                   let windowType = item.windowType,
                   let timeRange = item.timeRange,
                   let usage = item.usage,
-                  let limit = item.limit
+                  let limit = item.limit,
+                  limit > 0
             else {
                 continue
             }
@@ -1228,13 +1237,57 @@ enum MiniMaxUsageParser {
         return (windowType: windowType, timeRange: timeRange)
     }
 
-    private static func mapModelNameToServiceType(modelName: String) -> String {
-        let lower = modelName.lowercased()
+    private struct ServiceUsageInput {
+        let serviceType: String
+        let windowTypeOverride: String?
+        let total: Int?
+        let remaining: Int?
+        let start: Int?
+        let end: Int?
+        let remainsTime: Int?
+    }
 
+    private static func makeServiceUsage(_ input: ServiceUsageInput, now: Date) -> MiniMaxServiceUsage? {
+        guard let total = input.total, total > 0, let remaining = input.remaining else { return nil }
+        let used = max(0, total - remaining)
+        if used == 0, total == 0 { return nil }
+
+        let startTime = self.dateFromEpoch(input.start)
+        let endTime = self.dateFromEpoch(input.end)
+        var (windowType, timeRange) = self.parseWindowInfo(startTime: startTime, endTime: endTime, now: now)
+        if let windowTypeOverride = input.windowTypeOverride { windowType = windowTypeOverride }
+        if windowType.lowercased() == "weekly",
+           let weeklyRange = self.formatMiniMaxDateTimeRange(startTime: startTime, endTime: endTime)
+        {
+            timeRange = weeklyRange
+        }
+
+        let resetsAt = self.resetsAt(end: endTime, remains: input.remainsTime, now: now)
+        let resetDescription = self.resetDescription(
+            for: windowType,
+            timeRange: timeRange,
+            now: now,
+            resetsAt: resetsAt)
+
+        let percent = Double(used) / Double(total) * 100.0
+        return MiniMaxServiceUsage(
+            serviceType: input.serviceType,
+            windowType: windowType,
+            timeRange: timeRange,
+            usage: used,
+            limit: total,
+            percent: min(100.0, max(0.0, percent)),
+            resetsAt: resetsAt,
+            resetDescription: resetDescription)
+    }
+
+    private static func mapModelNameToServiceType(modelName: String) -> String {
         // Text Generation (文本生成): M2.7, M2.7-highspeed, MiniMax-M*, etc.
-        if lower.contains("minimax-m") {
+        if self.isTextGenerationModelName(modelName) {
             return "Text Generation"
         }
+
+        let lower = modelName.lowercased()
 
         // Text to Speech (语音合成): speech-hd, Speech 2.8, etc.
         if lower.contains("speech") {
@@ -1263,6 +1316,22 @@ enum MiniMaxUsageParser {
 
         // Default: use model name as-is
         return modelName
+    }
+
+    private static func isTextGenerationModelName(_ modelName: String) -> Bool {
+        let lower = modelName.lowercased()
+        return lower.contains("minimax-m") || lower.hasPrefix("m2.")
+    }
+
+    private static func formatMiniMaxDateTimeRange(startTime: Date?, endTime: Date?) -> String? {
+        guard let startTime, let endTime else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "MM/dd HH:mm"
+        let start = formatter.string(from: startTime)
+        let end = formatter.string(from: endTime)
+        return "\(start) - \(end)(UTC+8)"
     }
 }
 

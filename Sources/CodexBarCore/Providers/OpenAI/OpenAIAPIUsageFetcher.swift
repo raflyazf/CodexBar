@@ -44,7 +44,7 @@ public enum OpenAIAPIUsageFetcher {
         apiKey: String,
         costsURL: URL = Self.organizationCostsURL,
         completionsURL: URL = Self.organizationCompletionsUsageURL,
-        session: URLSession = .shared,
+        session transport: any ProviderHTTPTransport = ProviderHTTPClient.shared,
         now: Date = Date()) async throws -> OpenAIAPIUsageSnapshot
     {
         let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -58,12 +58,12 @@ public enum OpenAIAPIUsageFetcher {
             apiKey: trimmed,
             baseURL: costsURL,
             range: range,
-            session: session)
+            transport: transport)
         let completions = try await Self.fetchCompletions(
             apiKey: trimmed,
             baseURL: completionsURL,
             range: range,
-            session: session)
+            transport: transport)
 
         return Self.makeSnapshot(
             costs: costs,
@@ -87,7 +87,7 @@ public enum OpenAIAPIUsageFetcher {
         apiKey: String,
         baseURL: URL,
         range: DateRange,
-        session: URLSession) async throws -> CostsResponse
+        transport: any ProviderHTTPTransport) async throws -> CostsResponse
     {
         let url = Self.url(
             baseURL: baseURL,
@@ -95,7 +95,7 @@ public enum OpenAIAPIUsageFetcher {
             queryItems: [
                 URLQueryItem(name: "group_by", value: "line_item"),
             ])
-        let data = try await Self.fetchData(url: url, apiKey: apiKey, endpoint: "costs", session: session)
+        let data = try await Self.fetchData(url: url, apiKey: apiKey, endpoint: "costs", transport: transport)
         return try Self.decodeCosts(data)
     }
 
@@ -103,7 +103,7 @@ public enum OpenAIAPIUsageFetcher {
         apiKey: String,
         baseURL: URL,
         range: DateRange,
-        session: URLSession) async throws -> CompletionsUsageResponse
+        transport: any ProviderHTTPTransport) async throws -> CompletionsUsageResponse
     {
         let url = Self.url(
             baseURL: baseURL,
@@ -111,7 +111,7 @@ public enum OpenAIAPIUsageFetcher {
             queryItems: [
                 URLQueryItem(name: "group_by", value: "model"),
             ])
-        let data = try await Self.fetchData(url: url, apiKey: apiKey, endpoint: "completions", session: session)
+        let data = try await Self.fetchData(url: url, apiKey: apiKey, endpoint: "completions", transport: transport)
         return try Self.decodeCompletions(data)
     }
 
@@ -119,7 +119,7 @@ public enum OpenAIAPIUsageFetcher {
         url: URL,
         apiKey: String,
         endpoint: String,
-        session: URLSession) async throws -> Data
+        transport: any ProviderHTTPTransport) async throws -> Data
     {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -127,21 +127,17 @@ public enum OpenAIAPIUsageFetcher {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        let data: Data
-        let response: URLResponse
+        let response: ProviderHTTPResponse
         do {
-            (data, response) = try await session.data(for: request)
+            response = try await transport.response(for: request)
         } catch {
             throw OpenAIAPIUsageError.networkError(error.localizedDescription)
         }
 
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OpenAIAPIUsageError.networkError("Invalid response")
+        guard response.statusCode == 200 else {
+            throw OpenAIAPIUsageError.apiError(endpoint: endpoint, statusCode: response.statusCode)
         }
-        guard httpResponse.statusCode == 200 else {
-            throw OpenAIAPIUsageError.apiError(endpoint: endpoint, statusCode: httpResponse.statusCode)
-        }
-        return data
+        return response.data
     }
 
     private static func decodeCosts(_ data: Data) throws -> CostsResponse {
@@ -353,6 +349,17 @@ private struct CostResult: Decodable {
     struct Amount: Decodable {
         let value: Double?
         let currency: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case value
+            case currency
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.value = try container.decodeFlexibleDoubleIfPresent(forKey: .value)
+            self.currency = try container.decodeIfPresent(String.self, forKey: .currency)
+        }
     }
 
     let amount: Amount?
@@ -361,6 +368,33 @@ private struct CostResult: Decodable {
     private enum CodingKeys: String, CodingKey {
         case amount
         case lineItem = "line_item"
+    }
+}
+
+extension KeyedDecodingContainer {
+    fileprivate func decodeFlexibleDoubleIfPresent(forKey key: Key) throws -> Double? {
+        guard self.contains(key), try !self.decodeNil(forKey: key) else {
+            return nil
+        }
+
+        if let value = try? self.decode(Double.self, forKey: key) {
+            return value
+        }
+
+        if let rawValue = try? self.decode(String.self, forKey: key) {
+            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                return nil
+            }
+            if let value = Double(trimmed) {
+                return value
+            }
+        }
+
+        throw DecodingError.dataCorruptedError(
+            forKey: key,
+            in: self,
+            debugDescription: "Expected a number or numeric string for \(key.stringValue)")
     }
 }
 
